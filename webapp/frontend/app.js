@@ -16,8 +16,8 @@ const rankingStatePill = document.getElementById("ranking-state");
 const roundStatsBody = document.getElementById("round-stats-body");
 const gameSummaryPill = document.getElementById("game-summary");
 const languageSelect = document.getElementById("language-select");
-const SLOT_MIN = 2;
-const SLOT_MAX = 5;
+const SLOT_MIN = 1;
+const SLOT_MAX = 10;
 const LEVEL_MIN = 1;
 const LEVEL_MAX = 5;
 const PROFILE_BYTE_MIN = 0;
@@ -48,6 +48,7 @@ let translations = {
   "button.saveLevel": "Save level",
   "button.saveConfig": "Save config",
   "button.resetConfig": "Reset config",
+  "button.connecting": "Connecting...",
   "label.healthProfile": "Health (0-255)",
   "label.damageProfile": "Damage (0-255)",
   "label.ammoProfile": "Ammo (0-255)",
@@ -99,17 +100,24 @@ function applyTranslations() {
     el.setAttribute("placeholder", t(el.dataset.i18nPlaceholder));
   });
   document.title = t("app.title");
+  setScanBusy(scanBusy);
+  setConnectBusy(connectBusy);
   renderErrors();
+  renderCachedDevices();
 }
 
 let liveSource = null;
 const liveByAddress = new Map();
+const scannedDevicesByAddress = new Map();
 const liveLines = [];
 const MAX_LIVE_LINES = 2000;
 const LIVE_SEPARATOR = "----------------------------------------";
 const errorEntries = [];
 const MAX_ERROR_LINES = 100;
 const errorLastSeenByFingerprint = new Map();
+let scanBusy = false;
+let scanBusyTimer = null;
+let connectBusy = false;
 
 let currentView = "setup";
 let lastRankingSnapshot = {
@@ -125,7 +133,7 @@ let lastRankingSnapshot = {
   participants: [],
   ranking: [],
   slot_stats: [],
-  totals: { shots: 0, reloads: 0, hits: null, kills: null },
+  totals: { shots: 0, reloads: 0, hits: null, kills: null, assists: null },
 };
 
 function normalizeDetail(raw) {
@@ -220,6 +228,16 @@ function localizeErrorDetail(detail, status) {
   return clean || t("error.unknown");
 }
 
+function isScanBusyError(err) {
+  const detail = stripTupleDetail(
+    err?.detail ?? err?.message ?? (typeof err === "string" ? err : "")
+  ).toLowerCase();
+  return (
+    detail.includes("bluetooth discovery already running") ||
+    detail.includes("scan already in progress")
+  );
+}
+
 function renderErrors() {
   if (!errorsBand || !errorsBox) return;
   if (errorEntries.length === 0) {
@@ -293,6 +311,33 @@ function setResponse(payload) {
 function setStatus(text, ok = true) {
   statusPill.textContent = text;
   statusPill.classList.toggle("error", !ok);
+}
+
+function setScanBusy(isBusy, retryMs = 0) {
+  scanBusy = Boolean(isBusy);
+  if (scanBusyTimer) {
+    clearTimeout(scanBusyTimer);
+    scanBusyTimer = null;
+  }
+  if (scanButton) {
+    scanButton.disabled = scanBusy;
+    scanButton.textContent = scanBusy ? t("button.scanning") : t("button.scan");
+  }
+  if (scanBusy && retryMs > 0) {
+    scanBusyTimer = setTimeout(() => {
+      setScanBusy(false);
+    }, retryMs);
+  }
+}
+
+function setConnectBusy(isBusy) {
+  connectBusy = Boolean(isBusy);
+  const body = document.getElementById("devices-body");
+  if (!body) return;
+  for (const button of body.querySelectorAll("button[data-address]")) {
+    button.disabled = connectBusy;
+    button.textContent = connectBusy ? t("button.connecting") : t("button.connect");
+  }
 }
 
 function setLiveState(text, ok = true) {
@@ -383,6 +428,10 @@ function clampInt(value, min, max, fallback = min) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function safeSlotValue(value) {
+  return clampInt(value, SLOT_MIN, SLOT_MAX, SLOT_MIN);
 }
 
 function deriveLevelValue(conn) {
@@ -517,6 +566,53 @@ function normAddress(address) {
   return String(address || "").toLowerCase();
 }
 
+function cacheScannedDevice(device) {
+  const key = normAddress(device?.address);
+  if (!key) return;
+  const current = scannedDevicesByAddress.get(key) || {};
+  scannedDevicesByAddress.set(key, {
+    ...current,
+    ...device,
+    address: device.address || current.address,
+    name: device.name || current.name || device.display_name || current.display_name || "unknown",
+    rssi: device.rssi ?? current.rssi ?? null,
+  });
+}
+
+function cacheDeviceFromConnection(conn) {
+  const key = normAddress(conn?.address);
+  if (!key) return;
+  const current = scannedDevicesByAddress.get(key) || {};
+  scannedDevicesByAddress.set(key, {
+    ...current,
+    address: conn.address || current.address,
+    name: conn.name || current.name || conn.display_name || current.display_name || "unknown",
+    rssi: current.rssi ?? null,
+  });
+}
+
+function connectedAddressSet() {
+  const connected = new Set();
+  for (const entry of liveByAddress.values()) {
+    if (String(entry.connection_state || "").toLowerCase() === "connected") {
+      connected.add(normAddress(entry.address));
+    }
+  }
+  return connected;
+}
+
+function renderCachedDevices() {
+  const connected = connectedAddressSet();
+  const devices = Array.from(scannedDevicesByAddress.values())
+    .filter((dev) => !connected.has(normAddress(dev.address)))
+    .sort((a, b) => {
+      const nameCmp = String(a.name || "").localeCompare(String(b.name || ""));
+      if (nameCmp !== 0) return nameCmp;
+      return String(a.address || "").localeCompare(String(b.address || ""));
+    });
+  renderDevices(devices);
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -550,6 +646,36 @@ function formatEndReason(reason) {
     return t(key);
   }
   return reason;
+}
+
+function formatConnectionState(entry) {
+  const rawState = String(entry?.connection_state || "").trim();
+  const state = rawState.toLowerCase();
+  const reason = String(entry?.last_disconnect_reason || "").toLowerCase();
+  if (
+    reason === "team_confirmation" &&
+    ["awaiting_team_confirmation", "disconnected", "reconnecting"].includes(state)
+  ) {
+    return t("connection.state.awaitingTeamConfirmation");
+  }
+  const key = `connection.state.${state}`;
+  if (state && typeof translations[key] === "string") {
+    return t(key);
+  }
+  return rawState || t("misc.empty");
+}
+
+function formatConnectionAction(action, reason = "") {
+  const rawAction = String(action || "").trim();
+  const rawReason = String(reason || "").trim();
+  if (rawReason.toLowerCase() === "team_confirmation") {
+    return t("connection.action.teamConfirmationWait");
+  }
+  const key = `connection.action.${rawAction}`;
+  if (rawAction && typeof translations[key] === "string") {
+    return t(key);
+  }
+  return rawAction || t("state.connectionActionFallback");
 }
 
 function displayName(entry) {
@@ -679,9 +805,9 @@ function buildBlasterDebugText(entry) {
 }
 
 function formatLinkState(entry) {
-  const state = entry.connection_state || t("misc.empty");
+  const state = formatConnectionState(entry);
   const reconnect = entry.reconnect_count ?? 0;
-  if (entry.last_error) {
+  if (entry.last_error && entry.last_disconnect_reason !== "team_confirmation") {
     return t("connection.reconnectsWithError", { state, count: reconnect });
   }
   return t("connection.reconnects", { state, count: reconnect });
@@ -764,10 +890,12 @@ function renderLiveStatus() {
   );
   for (const item of items) {
     const ls = item.live_state || {};
+    const shots =
+      ls.shot_count == null ? (ls.trigger_count ?? 0) : Number(ls.shot_count);
     const ammo =
       ls.last_ammo_counter == null
         ? t("misc.empty")
-        : `0x${Number(ls.last_ammo_counter).toString(16).padStart(2, "0")}`;
+        : String(Number(ls.last_ammo_counter));
     const life =
       ls.last_life_counter == null
         ? t("misc.empty")
@@ -783,7 +911,7 @@ function renderLiveStatus() {
       <td>${escapeHtml(item.address || t("misc.empty"))}</td>
       <td>${escapeHtml(formatTeam(item.assigned_slot, item.assigned_team))}</td>
       <td>${escapeHtml(formatLinkState(item))}</td>
-      <td>${ls.trigger_count ?? 0}</td>
+      <td>${shots}</td>
       <td>${ls.reload_count ?? 0}</td>
       <td>${escapeHtml(ammo)}</td>
       <td>${escapeHtml(life)}</td>
@@ -793,7 +921,9 @@ function renderLiveStatus() {
     tr.addEventListener("click", () => {
       if (item.address) targetAddressInput.value = item.address;
       if (item.assigned_slot != null) {
-        document.getElementById("team-slot").value = String(item.assigned_slot);
+        document.getElementById("team-slot").value = String(
+          safeSlotValue(item.assigned_slot)
+        );
       }
       if (item.assigned_team != null) {
         document.getElementById("team-team").value = String(item.assigned_team);
@@ -816,8 +946,7 @@ function renderSetupTable(connections) {
   for (const conn of sorted) {
     const tr = document.createElement("tr");
     const safeAddress = conn.address || "";
-    const slotValue =
-      conn.assigned_slot == null ? SLOT_MIN : Number(conn.assigned_slot);
+    const slotValue = safeSlotValue(conn.assigned_slot);
     const teamValue = conn.assigned_team == null ? 2 : Number(conn.assigned_team);
     const localNameValue = conn.local_name || "";
     const levelValue = deriveLevelValue(conn);
@@ -905,7 +1034,7 @@ function renderSetupTable(connections) {
 
     saveTeamButton.addEventListener("click", (event) => {
       event.stopPropagation();
-      const slot = Number(slotInput.value);
+      const slot = safeSlotValue(slotInput.value);
       const team = Number(teamSelect.value);
       runAction(
         () => setTeamProfileByAddress(safeAddress, slot, team),
@@ -961,7 +1090,9 @@ function renderSetupTable(connections) {
 
     tr.addEventListener("click", () => {
       targetAddressInput.value = safeAddress;
-      document.getElementById("team-slot").value = String(slotInput.value);
+      document.getElementById("team-slot").value = String(
+        safeSlotValue(slotInput.value)
+      );
       document.getElementById("team-team").value = String(teamSelect.value);
     });
 
@@ -1013,8 +1144,9 @@ function renderRanking(snapshot) {
       <td>${item.reloads ?? 0}</td>
       <td>${item.hits ?? t("misc.empty")}</td>
       <td>${item.kills ?? t("misc.empty")}</td>
+      <td>${item.assists ?? t("misc.empty")}</td>
       <td>${escapeHtml(formatPercent(item.accuracy_percent))}</td>
-      <td>${escapeHtml(item.connection_state || t("misc.empty"))}</td>
+      <td>${escapeHtml(formatConnectionState(item))}</td>
     `;
     tr.addEventListener("click", () => {
       if (item.address) {
@@ -1041,6 +1173,7 @@ function renderRoundStats(snapshot) {
     reloads: totals.reloads ?? 0,
     hits: totals.hits ?? t("misc.empty"),
     kills: totals.kills ?? t("misc.empty"),
+    assists: totals.assists ?? t("misc.empty"),
   });
 
   if (snapshot.running) {
@@ -1062,6 +1195,7 @@ function renderRoundStats(snapshot) {
       <td>${escapeHtml(formatTeam(item.slot, item.team))}</td>
       <td>${item.hits ?? t("misc.empty")}</td>
       <td>${item.kills ?? t("misc.empty")}</td>
+      <td>${item.assists ?? t("misc.empty")}</td>
     `;
     tr.addEventListener("click", () => {
       if (item.address) {
@@ -1083,6 +1217,7 @@ function applyConnectionList(connections) {
   const present = new Set();
   for (const conn of connections) {
     present.add(normAddress(conn.address));
+    cacheDeviceFromConnection(conn);
     upsertLiveEntry({
       address: conn.address,
       name: conn.name,
@@ -1095,6 +1230,7 @@ function applyConnectionList(connections) {
       auto_reconnect: conn.auto_reconnect,
       reconnect_count: conn.reconnect_count,
       disconnect_count: conn.disconnect_count,
+      last_disconnect_reason: conn.last_disconnect_reason,
       last_error: conn.last_error,
       connected_at: conn.connected_at,
       blaster_type: conn.blaster_type,
@@ -1113,6 +1249,7 @@ function applyConnectionList(connections) {
   }
   renderConnections(connections);
   renderSetupTable(connections);
+  renderCachedDevices();
   renderLiveStatus();
 }
 
@@ -1141,7 +1278,9 @@ function renderConnections(connections) {
     tr.addEventListener("click", () => {
       targetAddressInput.value = conn.address;
       if (conn.assigned_slot != null) {
-        document.getElementById("team-slot").value = String(conn.assigned_slot);
+        document.getElementById("team-slot").value = String(
+          safeSlotValue(conn.assigned_slot)
+        );
       }
       if (conn.assigned_team != null) {
         document.getElementById("team-team").value = String(conn.assigned_team);
@@ -1176,11 +1315,14 @@ function handleConnectionEvent(payload, ts) {
       auto_reconnect: conn.auto_reconnect,
       reconnect_count: conn.reconnect_count,
       disconnect_count: conn.disconnect_count,
+      last_disconnect_reason: conn.last_disconnect_reason,
       last_error: conn.last_error,
       connected_at: conn.connected_at,
       blaster_type: conn.blaster_type,
       last_snapshot: conn.last_snapshot,
     });
+    cacheDeviceFromConnection(conn);
+    renderCachedDevices();
     pushLiveLine(
       `${ts} ${t("live.connected", { address: conn.address || t("misc.empty") })}`
     );
@@ -1194,7 +1336,13 @@ function handleConnectionEvent(payload, ts) {
   }
 
   if (payload.action === "disconnected") {
+    cacheScannedDevice({
+      address: payload.address,
+      name: payload.name || payload.display_name || "unknown",
+      rssi: null,
+    });
     removeLiveEntry(payload.address);
+    renderCachedDevices();
     clearTargetIfMatches(payload.address);
     pushLiveLine(
       `${ts} ${t("live.disconnected", { address: payload.address || t("misc.empty") })}`
@@ -1214,7 +1362,9 @@ function handleConnectionEvent(payload, ts) {
   const derivedState =
     payload.connection_state != null
       ? payload.connection_state
-      : payload.action === "lost"
+      : payload.action === "team_confirmation_wait"
+        ? "awaiting_team_confirmation"
+        : payload.action === "lost"
         ? "disconnected"
         : payload.action === "reconnect_attempt"
           ? "reconnecting"
@@ -1224,7 +1374,7 @@ function handleConnectionEvent(payload, ts) {
   const derivedError =
     payload.error != null
       ? payload.error
-      : payload.reason != null
+      : payload.reason != null && payload.reason !== "team_confirmation"
         ? payload.reason
         : existing.last_error ?? null;
 
@@ -1241,12 +1391,14 @@ function handleConnectionEvent(payload, ts) {
       payload.auto_reconnect ?? payload.enabled ?? existing.auto_reconnect ?? null,
     reconnect_count: payload.reconnect_count ?? existing.reconnect_count ?? null,
     disconnect_count: payload.disconnect_count ?? existing.disconnect_count ?? null,
+    last_disconnect_reason:
+      payload.reason ?? existing.last_disconnect_reason ?? null,
     last_error: derivedError,
   });
   pushLiveLine(
     `${ts} ${t("live.connectionAction", {
       address: payload.address || t("misc.empty"),
-      action: payload.action || t("state.connectionActionFallback"),
+      action: formatConnectionAction(payload.action, payload.reason),
     })}`
   );
   const debugEntry = liveByAddress.get(normAddress(payload.address));
@@ -1475,26 +1627,61 @@ function renderDevices(devices) {
       <td><button type="button" data-address="${escapeHtml(dev.address)}">${escapeHtml(t("button.connect"))}</button></td>
     `;
     const button = tr.querySelector("button");
-    button.addEventListener("click", () => runAction(() => connectDevice(dev.address)));
+    button.disabled = connectBusy;
+    button.textContent = connectBusy ? t("button.connecting") : t("button.connect");
+    button.addEventListener("click", () => {
+      if (connectBusy) return;
+      setConnectBusy(true);
+      runAction(
+        async () => {
+          try {
+            return await connectDevice(dev.address);
+          } finally {
+            setConnectBusy(false);
+          }
+        },
+        { contextKey: "context.liveConnection" }
+      );
+    });
     body.appendChild(tr);
   }
 }
 
 async function scan() {
+  if (scanBusy) {
+    return { status: "busy" };
+  }
+  setScanBusy(true);
   const timeout = Number(document.getElementById("scan-timeout").value);
   const byName = document.getElementById("scan-by-name").checked;
   const name = document.getElementById("scan-name").value.trim() || "NerfV";
-  const result = await api("/api/scan", {
-    method: "POST",
-    body: JSON.stringify({
-      timeout,
-      by_name: byName,
-      name,
-      expected_count: 0,
-    }),
-  });
-  renderDevices(result.devices || []);
-  return result;
+  try {
+    const result = await api("/api/scan", {
+      method: "POST",
+      body: JSON.stringify({
+        timeout,
+        by_name: byName,
+        name,
+        expected_count: 0,
+      }),
+    });
+    for (const dev of result.devices || []) {
+      cacheScannedDevice(dev);
+    }
+    renderCachedDevices();
+    return result;
+  } catch (err) {
+    if (isScanBusyError(err)) {
+      setScanBusy(true, Math.max(3000, timeout * 1000));
+    } else {
+      setScanBusy(false);
+    }
+    throw err;
+  } finally {
+    if (!scanBusyTimer) {
+      setScanBusy(false);
+    }
+  }
 }
 
 async function enableBluetooth() {
@@ -1518,22 +1705,34 @@ async function refreshRanking() {
 }
 
 async function connectDevice(address) {
+  const cached = scannedDevicesByAddress.get(normAddress(address));
   const result = await api("/api/connect", {
     method: "POST",
     body: JSON.stringify({ address, timeout: 15.0 }),
   });
+  cacheScannedDevice({
+    ...(cached || {}),
+    ...(result.connection || {}),
+    address,
+  });
   targetAddressInput.value = address;
   await refreshConnections();
+  renderCachedDevices();
   return result;
 }
 
 async function disconnectDevice(address) {
+  const known = liveByAddress.get(normAddress(address));
+  if (known) {
+    cacheDeviceFromConnection(known);
+  }
   const result = await api(`/api/disconnect/${encodeURIComponent(address)}`, {
     method: "POST",
     body: JSON.stringify({}),
   });
   clearTargetIfMatches(address);
   await refreshConnections();
+  renderCachedDevices();
   await refreshRanking();
   return result;
 }
@@ -1693,7 +1892,7 @@ async function setLevelByAddress(
 
 async function setTeamProfile() {
   const address = mustTargetAddress();
-  const slot = Number(document.getElementById("team-slot").value);
+  const slot = safeSlotValue(document.getElementById("team-slot").value);
   const team = Number(document.getElementById("team-team").value);
   return setTeamProfileByAddress(address, slot, team);
 }
@@ -1902,11 +2101,8 @@ function bindClick(id, handler) {
 
 if (scanButton) {
   scanButton.addEventListener("click", () => {
-    runAction(scan, {
-      button: scanButton,
-      busyText: t("button.scanning"),
-      contextKey: "context.deviceScan",
-    });
+    if (scanBusy) return;
+    runAction(scan, { contextKey: "context.deviceScan" });
   });
 }
 if (enableBluetoothButton) {
@@ -1926,7 +2122,11 @@ bindClick("btn-refresh-connections", () =>
   runAction(refreshConnections, { contextKey: "context.viewSetup" })
 );
 bindClick("btn-setup-start-multi", () =>
-  runAction(startGameMultiSetup, { contextKey: "context.start" })
+  runAction(startGameMultiSetup, {
+    contextKey: "context.start",
+    button: document.getElementById("btn-setup-start-multi"),
+    busyText: t("button.startingRound"),
+  })
 );
 bindClick("btn-refresh-ranking", () =>
   runAction(refreshRanking, { contextKey: "context.liveRanking" })
@@ -1954,7 +2154,11 @@ bindClick("btn-set-team", () =>
 );
 bindClick("btn-game-start", () => runAction(startGame, { contextKey: "context.start" }));
 bindClick("btn-game-start-multi", () =>
-  runAction(startGameMultiAdmin, { contextKey: "context.start" })
+  runAction(startGameMultiAdmin, {
+    contextKey: "context.start",
+    button: document.getElementById("btn-game-start-multi"),
+    busyText: t("button.startingRound"),
+  })
 );
 bindClick("btn-game-end-admin", () =>
   runAction(endGame, { contextKey: "context.action" })

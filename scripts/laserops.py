@@ -93,7 +93,7 @@ VOLUME_MAX = 0x1F  # 31 decimal
 # - slots are seen in low single digits
 # - teams are seen up to 2, with test_12 showing 2 for all-vs-all
 ASSIGNMENT_SLOT_MIN = 0x00
-ASSIGNMENT_SLOT_MAX = 0x05
+ASSIGNMENT_SLOT_MAX = 0x0A
 ASSIGNMENT_TEAM_MIN = 0x00
 ASSIGNMENT_TEAM_MAX = 0x02
 
@@ -521,6 +521,40 @@ def find_char_by_uuid(client: BleakClient, uuid: str):
     return None
 
 
+def find_notify_char_by_properties(client: BleakClient):
+    """Fallback for firmware exposing compatible properties under other UUIDs."""
+    if client.services is None:
+        return None
+    for service in client.services:
+        for char in service.characteristics:
+            props = {str(prop).lower() for prop in char.properties}
+            if "notify" in props:
+                return char
+    return None
+
+
+def find_write_char_by_properties(client: BleakClient):
+    """Fallback for firmware exposing compatible write properties under other UUIDs."""
+    if client.services is None:
+        return None
+    candidates = []
+    for service in client.services:
+        for char in service.characteristics:
+            props = {str(prop).lower() for prop in char.properties}
+            if "write-without-response" in props or "write" in props:
+                candidates.append((char, props))
+    for char, props in candidates:
+        if "write-without-response" in props and "notify" not in props:
+            return char
+    for char, props in candidates:
+        if "write-without-response" in props:
+            return char
+    for char, props in candidates:
+        if "write" in props and "notify" not in props:
+            return char
+    return candidates[0][0] if candidates else None
+
+
 def describe_characteristics(client: BleakClient) -> str:
     """Return a compact overview of discovered characteristics for diagnostics."""
     if client.services is None:
@@ -608,6 +642,13 @@ class LaserOpsDevice:
                 self._notify_char = find_char_by_uuid(self._client, NOTIFY_CHAR_UUID)
             if self._write_char is None:
                 self._write_char = find_char_by_uuid(self._client, WRITE_CHAR_UUID)
+
+            # Some blasters expose compatible notify/write characteristics under
+            # vendor-specific UUIDs instead of the captured LaserOps UUIDs.
+            if self._notify_char is None:
+                self._notify_char = find_notify_char_by_properties(self._client)
+            if self._write_char is None:
+                self._write_char = find_write_char_by_properties(self._client)
 
             # If services are unavailable on this backend/version, use UUID strings
             # directly because Bleak accepts UUID specifiers for I/O calls.

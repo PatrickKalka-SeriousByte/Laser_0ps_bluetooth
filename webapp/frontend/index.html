@@ -145,6 +145,7 @@
             <th data-i18n="table.reloads">Reloads</th>
             <th data-i18n="table.hits">Hits</th>
             <th data-i18n="table.kills">Kills</th>
+            <th data-i18n="table.assists">Assists</th>
             <th data-i18n="table.accuracy">Accuracy</th>
             <th data-i18n="table.connection">Connection</th>
           </tr>
@@ -168,6 +169,7 @@
             <th data-i18n="table.team">Team</th>
             <th data-i18n="table.hits">Hits</th>
             <th data-i18n="table.kills">Kills</th>
+            <th data-i18n="table.assists">Assists</th>
           </tr>
           </thead>
           <tbody id="round-stats-body"></tbody>
@@ -189,7 +191,7 @@
             <th data-i18n="table.address">Address</th>
             <th data-i18n="table.team">Team</th>
             <th data-i18n="table.connection">Connection</th>
-            <th data-i18n="table.trigger">Trigger</th>
+              <th data-i18n="table.shots">Shots</th>
             <th data-i18n="table.reload">Reload</th>
             <th data-i18n="table.ammo">Ammo</th>
             <th data-i18n="table.life">Life</th>
@@ -230,8 +232,8 @@
       </div>
 
       <div class="row">
-        <label><span data-i18n="label.teamSlotUnique">Team slot (2-5, unique per blaster)</span>
-          <input id="team-slot" type="number" min="2" max="5" value="2">
+        <label><span data-i18n="label.teamSlotUnique">Team slot (1-10, unique per blaster)</span>
+          <input id="team-slot" type="number" min="1" max="10" value="1">
         </label>
         <label><span data-i18n="label.team">Team</span>
           <select id="team-team">

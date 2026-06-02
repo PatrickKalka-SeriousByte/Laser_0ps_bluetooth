@@ -26,16 +26,21 @@ SAFE_NAME_INDEX_MIN = 0
 SAFE_NAME_INDEX_MAX = 49
 SAFE_PROFILE_BYTE_MIN = 0x00
 SAFE_PROFILE_BYTE_MAX = 0xFF
-SAFE_SLOT_MIN = 2
-SAFE_SLOT_MAX = 5
+SAFE_SLOT_MIN = 1
+SAFE_SLOT_MAX = 10
 SAFE_TEAM_MIN = 0
 SAFE_TEAM_MAX = 2
 # Test 12 (all-vs-all) shows team id 0x02 for all participants.
 SAFE_MULTIPLAYER_FFA_TEAM = 2
 SAFE_GAME_DELAY_MIN = 0.00
 SAFE_GAME_DELAY_MAX = 0.30
-SAFE_MULTI_START_MAX_DEVICES = 4
+SAFE_MULTI_START_MAX_DEVICES = SAFE_SLOT_MAX - SAFE_SLOT_MIN + 1
 SAFE_MULTI_RECONNECT_TIMEOUT = 8.0
+FOLLOWUP_ROUND_RECYCLE_WAIT_SECONDS = 4.0
+FOLLOWUP_ROUND_RECYCLE_CONNECT_TIMEOUT = 15.0
+FOLLOWUP_ROUND_RECYCLE_CONNECT_ATTEMPTS = 2
+FOLLOWUP_ROUND_RECYCLE_RETRY_DELAY_SECONDS = 2.0
+FOLLOWUP_ROUND_RECYCLE_CANCEL_TIMEOUT_SECONDS = 2.0
 SAFE_STARTUP_VOLUME_DEFAULT = 0
 SAFE_GAME_DURATION_SECONDS_DEFAULT = 300
 SAFE_GAME_DURATION_SECONDS_MIN = 30
@@ -50,6 +55,8 @@ LOCAL_NAME_MAX_LENGTH = 32
 LOCAL_NAME_STORE_FILENAME = "local_names.json"
 DEBUG_EVENT_LOG_FILENAME = "live_event_log.ndjson"
 ROUND_SLOT_STATS_ERROR_DETAIL_LIMIT = 8
+AUTO_END_ROUND_SHOTS_GRACE_SECONDS = 3.0
+TEAM_CONFIRMATION_LINK_LOSS_WINDOW_SECONDS = 3.0
 # Some firmware revisions emit back-to-back duplicate trigger/reload notifications
 # for one physical action. Keep a tiny dedupe window so live shot/reload counters
 # match real actions while preserving raw event visibility.
@@ -347,6 +354,15 @@ class ConnectionState:
             "last_event": None,
             "last_event_ts": None,
             "last_raw": None,
+            "shot_count": 0,
+            "shot_count_source": None,
+            "received_hit_count": 0,
+            "received_kill_count": 0,
+            "received_assist_count": 0,
+            "received_hits_by_attacker_slot": {},
+            "received_kills_by_attacker_slot": {},
+            "received_assists_by_attacker_slot": {},
+            "current_life_damage_by_attacker_slot": {},
             "trigger_count": 0,
             "reload_count": 0,
             "trigger_raw_count": 0,
@@ -355,10 +371,18 @@ class ConnectionState:
             "last_status_word": None,
             "last_ammo_family": None,
             "last_ammo_counter": None,
+            "last_ammo_delta": None,
+            "startup_ammo_profile": None,
+            "configured_ammo_profile": None,
             "last_life_mode_a": None,
             "last_life_mode_b": None,
             "last_life_family": None,
             "last_life_counter": None,
+            "last_life_attacker_slot": None,
+            "last_life_delta": None,
+            "last_life_assist_slots": [],
+            "startup_health_profile": None,
+            "configured_health_profile": None,
             "last_life_marker_family": None,
             "last_life_marker_counter": None,
             "respawn_ready_count": 0,
@@ -366,6 +390,10 @@ class ConnectionState:
             "last_reload_variant": None,
             "last_stat_type": None,
             "last_stat_counter": None,
+            "last_round_shots": None,
+            "last_round_shots_ts": None,
+            "last_round_shots_raw": None,
+            "round_shots_report_count": 0,
             "startup_level": None,
             "startup_name_a": None,
             "startup_name_b": None,
@@ -384,6 +412,41 @@ class ConnectionState:
 
     def live_state_snapshot(self) -> dict[str, Any]:
         return copy.deepcopy(self.live_state)
+
+    def _configured_start_life(self) -> int | None:
+        state = self.live_state
+        raw_values = (
+            state.get("configured_health_profile"),
+            state.get("startup_health_profile"),
+        )
+        for raw in raw_values:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            return max(0, min(0xFF, value))
+        return None
+
+    def _configured_start_ammo(self) -> int | None:
+        state = self.live_state
+        raw_values = (
+            state.get("configured_ammo_profile"),
+            state.get("startup_ammo_profile"),
+        )
+        for raw in raw_values:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            return max(0, min(0xFF, value))
+        return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _update_live_state(self, *, payload: bytes, decoded: str, ts: float) -> None:
         state = self.live_state
@@ -409,11 +472,19 @@ class ConnectionState:
             return
         if payload in (bytes.fromhex("310a"), bytes.fromhex("310d")):
             state["last_reload_variant"] = payload[1]
+            start_ammo = self._configured_start_ammo()
+            if start_ammo is not None:
+                state["last_ammo_counter"] = start_ammo
+                state["last_ammo_family"] = state.get("last_ammo_family") or start_ammo
+                state["last_ammo_delta"] = 0
+                state["ammo_reset_source"] = "reload_marker_b"
             return
         if len(payload) == 13 and payload[:1] == b"\x35":
             state["startup_level"] = payload[8]
             state["startup_name_a"] = payload[9]
             state["startup_name_b"] = payload[10]
+            state["startup_ammo_profile"] = payload[2]
+            state["startup_health_profile"] = payload[7]
             state["startup_raw"] = payload.hex()
             state["startup_blaster_type"] = _detect_blaster_type_from_snapshot_raw(
                 payload.hex()
@@ -423,18 +494,96 @@ class ConnectionState:
             state["last_status_word"] = (payload[1] << 8) | payload[2]
             return
         if len(payload) >= 2 and payload[:1] == b"\x32":
+            new_counter = int(payload[-1])
+            previous_counter = self._safe_int(state.get("last_ammo_counter"))
+            if previous_counter is None:
+                previous_counter = self._configured_start_ammo()
+            if previous_counter is not None:
+                delta = previous_counter - new_counter
+                if delta > 0:
+                    state["shot_count"] = int(state.get("shot_count", 0) or 0) + delta
+                    state["shot_count_source"] = "ammo_delta"
+                    state["last_ammo_delta"] = delta
+                elif delta < 0:
+                    state["last_ammo_delta"] = 0
+                    state["ammo_reset_source"] = "ammo_state_increase"
+                else:
+                    state["last_ammo_delta"] = 0
             state["last_ammo_family"] = payload[1]
-            state["last_ammo_counter"] = payload[-1]
+            state["last_ammo_counter"] = new_counter
             return
         if (
             len(payload) == 5
             and payload[0] == 0x30
             and payload[:3] != bytes([0x30, 0x01, 0x3F])
         ):
+            previous_life = self._safe_int(state.get("last_life_counter"))
+            if previous_life is None:
+                previous_life = self._configured_start_life()
+            attacker_slot = int(payload[2])
+            new_life = int(payload[4])
+            state["last_life_attacker_slot"] = attacker_slot
+            if previous_life is not None and new_life < previous_life:
+                delta = previous_life - new_life
+                slot_key = str(attacker_slot)
+                hits_by_slot = state.setdefault(
+                    "received_hits_by_attacker_slot", {}
+                )
+                kills_by_slot = state.setdefault(
+                    "received_kills_by_attacker_slot", {}
+                )
+                assists_by_slot = state.setdefault(
+                    "received_assists_by_attacker_slot", {}
+                )
+                current_damage_by_slot = state.setdefault(
+                    "current_life_damage_by_attacker_slot", {}
+                )
+                hits_by_slot[slot_key] = int(hits_by_slot.get(slot_key, 0) or 0) + delta
+                current_damage_by_slot[slot_key] = (
+                    int(current_damage_by_slot.get(slot_key, 0) or 0) + delta
+                )
+                state["received_hit_count"] = (
+                    int(state.get("received_hit_count", 0) or 0) + delta
+                )
+                state["last_life_delta"] = delta
+                state["last_life_assist_slots"] = []
+                if new_life == 0:
+                    kills_by_slot[slot_key] = (
+                        int(kills_by_slot.get(slot_key, 0) or 0) + 1
+                    )
+                    state["received_kill_count"] = (
+                        int(state.get("received_kill_count", 0) or 0) + 1
+                    )
+                    assist_slots: list[int] = []
+                    for assist_slot_key, assist_damage in current_damage_by_slot.items():
+                        if assist_slot_key == slot_key:
+                            continue
+                        try:
+                            assist_slot = int(assist_slot_key)
+                            assist_damage_count = int(assist_damage)
+                        except (TypeError, ValueError):
+                            continue
+                        if assist_slot <= 0 or assist_damage_count <= 0:
+                            continue
+                        assists_by_slot[assist_slot_key] = (
+                            int(assists_by_slot.get(assist_slot_key, 0) or 0) + 1
+                        )
+                        state["received_assist_count"] = (
+                            int(state.get("received_assist_count", 0) or 0) + 1
+                        )
+                        assist_slots.append(assist_slot)
+                    state["last_life_assist_slots"] = sorted(assist_slots)
+                    state["current_life_damage_by_attacker_slot"] = {}
+            else:
+                state["last_life_delta"] = 0
+                if previous_life is not None and new_life > previous_life:
+                    state["life_reset_source"] = "life_counter_increase"
+                    state["current_life_damage_by_attacker_slot"] = {}
+                    state["last_life_assist_slots"] = []
             state["last_life_mode_a"] = payload[1]
             state["last_life_mode_b"] = payload[2]
             state["last_life_family"] = payload[3]
-            state["last_life_counter"] = payload[4]
+            state["last_life_counter"] = new_life
             return
         if len(payload) == 5 and payload[:3] == bytes([0x30, 0x01, 0x3F]):
             state["last_stat_type"] = payload[3]
@@ -443,6 +592,13 @@ class ConnectionState:
         if payload == bytes([0x3F]):
             state["respawn_ready_count"] += 1
             state["last_respawn_ready_ts"] = ts
+            start_life = self._configured_start_life()
+            if start_life is not None:
+                state["last_life_counter"] = start_life
+                state["last_life_family"] = state.get("last_life_family") or 0x0A
+                state["life_reset_source"] = "respawn_ready"
+            state["current_life_damage_by_attacker_slot"] = {}
+            state["last_life_assist_slots"] = []
             return
         if payload == bytes([0x3E, 0x01, 0x00]):
             state["stats_terminal_count"] += 1
@@ -450,6 +606,14 @@ class ConnectionState:
         if len(payload) == 3 and payload[0] == 0x3E:
             state["last_life_marker_family"] = payload[1]
             state["last_life_marker_counter"] = payload[2]
+            return
+        if len(payload) == 3 and payload[0] == 0x47:
+            state["last_round_shots"] = (payload[1] << 8) | payload[2]
+            state["last_round_shots_ts"] = ts
+            state["last_round_shots_raw"] = payload.hex()
+            state["round_shots_report_count"] = (
+                int(state.get("round_shots_report_count", 0) or 0) + 1
+            )
             return
 
 
@@ -460,13 +624,18 @@ class GameSessionState:
     duration_seconds: int
     planned_end_at: float
     participant_keys: list[str]
+    baseline_shots: dict[str, int]
     baseline_triggers: dict[str, int]
     baseline_reloads: dict[str, int]
+    baseline_life_slot_stats: dict[int, dict[str, int]]
+    baseline_round_shot_reports: dict[str, int]
     status: str = "running"
     ended_at: float | None = None
     end_reason: str | None = None
     final_snapshot: dict[str, Any] | None = None
     final_slot_stats: dict[int, dict[str, int]] = field(default_factory=dict)
+    final_round_shots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    round_shot_wait: dict[str, Any] | None = None
 
 
 class BleHub:
@@ -474,13 +643,14 @@ class BleHub:
         self._connections: dict[str, ConnectionState] = {}
         self._connections_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()
         self._bulk_game_start_lock = asyncio.Lock()
         self._state_dir = Path(__file__).resolve().parent / "state"
         self._state_dir.mkdir(parents=True, exist_ok=True)
         self._local_name_store_path = self._state_dir / LOCAL_NAME_STORE_FILENAME
         self._debug_event_log_path = self._state_dir / DEBUG_EVENT_LOG_FILENAME
         self._debug_event_log_lock = asyncio.Lock()
-        self._local_names: dict[str, str] = self._load_local_name_store()
+        self._local_names, self._local_team_profiles = self._load_local_name_store()
         self._local_names_lock = asyncio.Lock()
         self._game_session_lock = asyncio.Lock()
         self._game_session: GameSessionState | None = None
@@ -533,6 +703,10 @@ class BleHub:
         return result
 
     async def connect(self, address: str, timeout: float) -> dict[str, Any]:
+        async with self._connect_lock:
+            return await self._connect_serialized(address, timeout)
+
+    async def _connect_serialized(self, address: str, timeout: float) -> dict[str, Any]:
         normalized = self._normalize_address(address)
         key = normalized.lower()
         async with self._connections_lock:
@@ -554,6 +728,7 @@ class BleHub:
         )
         async with self._local_names_lock:
             placeholder.local_name = self._local_names.get(key)
+            stored_team_profile = self._local_team_profiles.get(key)
         notification_cb, disconnected_cb, write_cb = self._build_device_callbacks(
             placeholder
         )
@@ -576,13 +751,23 @@ class BleHub:
                 for conn in self._connections.values()
                 if conn.assigned_slot is not None
             }
-            slot = SAFE_SLOT_MIN
-            while slot in used_slots and slot <= SAFE_SLOT_MAX:
-                slot += 1
+            slot = None
+            team = None
+            if stored_team_profile is not None:
+                stored_slot, stored_team = stored_team_profile
+                if stored_slot not in used_slots:
+                    slot = stored_slot
+                    team = stored_team
+            if slot is None:
+                slot = SAFE_SLOT_MIN
+                while slot in used_slots and slot <= SAFE_SLOT_MAX:
+                    slot += 1
             if slot > SAFE_SLOT_MAX:
                 slot = SAFE_SLOT_MIN
             placeholder.assigned_slot = slot
-            placeholder.assigned_team = self._default_team_for_slot(slot)
+            placeholder.assigned_team = (
+                team if team is not None else self._default_team_for_slot(slot)
+            )
             self._connections[key] = placeholder
 
         await self._refresh_startup_snapshot(
@@ -609,6 +794,7 @@ class BleHub:
         conn.connection_state = "disconnected"
         conn.last_disconnect_reason = "manual_disconnect"
         conn.last_disconnect_at = time.time()
+        await self._persist_connection_local_profile(conn)
         self._cancel_reconnect_task(conn)
         await conn.gun.__aexit__(None, None, None)
         self._schedule_event(
@@ -638,6 +824,7 @@ class BleHub:
             conn.connection_state = "disconnected"
             conn.last_disconnect_reason = "manual_disconnect_all"
             conn.last_disconnect_at = time.time()
+            await self._persist_connection_local_profile(conn)
             self._cancel_reconnect_task(conn)
             try:
                 await conn.gun.__aexit__(None, None, None)
@@ -796,6 +983,18 @@ class BleHub:
                         )
             conn.assigned_slot = safe_slot
             conn.assigned_team = safe_team
+            key = self._normalize_address(conn.address).lower()
+            async with self._local_names_lock:
+                previous_profile = self._local_team_profiles.get(key)
+                self._local_team_profiles[key] = (safe_slot, safe_team)
+                try:
+                    self._save_local_name_store()
+                except Exception:
+                    if previous_profile is None:
+                        self._local_team_profiles.pop(key, None)
+                    else:
+                        self._local_team_profiles[key] = previous_profile
+                    raise
             summary = self.connection_summary(conn)
             self._schedule_event(
                 "team_profile",
@@ -817,10 +1016,16 @@ class BleHub:
             key = self._normalize_address(conn.address).lower()
             async with self._local_names_lock:
                 previous_stored_name = self._local_names.get(key)
+                previous_stored_profile = self._local_team_profiles.get(key)
                 if safe_local_name is None:
                     self._local_names.pop(key, None)
                 else:
                     self._local_names[key] = safe_local_name
+                if conn.assigned_slot is not None and conn.assigned_team is not None:
+                    self._local_team_profiles[key] = (
+                        int(conn.assigned_slot),
+                        int(conn.assigned_team),
+                    )
                 try:
                     self._save_local_name_store()
                 except Exception:
@@ -828,6 +1033,10 @@ class BleHub:
                         self._local_names.pop(key, None)
                     else:
                         self._local_names[key] = previous_stored_name
+                    if previous_stored_profile is None:
+                        self._local_team_profiles.pop(key, None)
+                    else:
+                        self._local_team_profiles[key] = previous_stored_profile
                     conn.local_name = previous_local_name
                     raise
             summary = self.connection_summary(conn)
@@ -858,7 +1067,10 @@ class BleHub:
         safe_duration_seconds = self._validate_game_duration(duration_seconds)
         async with self._bulk_game_start_lock:
             conn = await self._get(address)
-            await self._ensure_connected(conn)
+            if not conn.gun.is_connected:
+                raise ValueError(
+                    f"device not connected at game start: {conn.address}"
+                )
             await self._finalize_game_session(
                 reason="superseded_by_new_start",
                 send_close=True,
@@ -876,6 +1088,7 @@ class BleHub:
                 startup_volume=startup_volume,
                 delay=safe_delay,
                 duration_seconds=safe_duration_seconds,
+                allow_reconnect=False,
             )
             conn.last_snapshot = _snapshot_to_dict(snapshot)
             startup_performed = True
@@ -924,6 +1137,7 @@ class BleHub:
         delay: float,
         force_startup: bool,
         duration_seconds: int = SAFE_GAME_DURATION_SECONDS_DEFAULT,
+        auto_recycle_followup: bool = True,
     ) -> dict[str, Any]:
         safe_delay = self._validate_safe_game_delay(delay)
         safe_duration_seconds = self._validate_game_duration(duration_seconds)
@@ -931,20 +1145,10 @@ class BleHub:
             requested_conns = await self._resolve_connections(addresses)
             if len(requested_conns) < 2:
                 raise ValueError("multiplayer start requires at least 2 connected blasters")
-            reconnect_errors: dict[str, str] = {}
-            for conn in requested_conns:
-                if conn.gun.is_connected or not conn.desired_connected:
-                    continue
-                try:
-                    await self._ensure_connected(
-                        conn,
-                        timeout=SAFE_MULTI_RECONNECT_TIMEOUT,
-                    )
-                except Exception as exc:
-                    reconnect_errors[conn.address.lower()] = self._format_error(exc)
-
-            connected_for_start = [conn for conn in requested_conns if conn.gun.is_connected]
-            disconnected_conns = [conn for conn in requested_conns if not conn.gun.is_connected]
+            recycle_followup = (
+                bool(auto_recycle_followup)
+                and await self._should_recycle_for_followup_round_start()
+            )
             await self._finalize_game_session(
                 reason="superseded_by_new_start",
                 send_close=True,
@@ -956,15 +1160,31 @@ class BleHub:
                     f"too many devices for one synchronized start "
                     f"({len(requested_conns)} > {SAFE_MULTI_START_MAX_DEVICES})"
                 )
+
+            team_profiles = self._resolve_multi_team_profiles(requested_conns)
+            self._validate_multi_team_mode(team_profiles)
             busy = [conn.address for conn in requested_conns if conn.op_lock.locked()]
             if busy:
                 raise ValueError(
                     "devices are busy; retry after current operation: "
                     + ", ".join(busy)
                 )
-
-            team_profiles = self._resolve_multi_team_profiles(requested_conns)
-            self._validate_multi_team_mode(team_profiles)
+            recycle_result = None
+            if recycle_followup:
+                requested_conns, recycle_result = (
+                    await self._recycle_connections_for_followup_start(
+                        conns=requested_conns,
+                        team_profiles=team_profiles,
+                    )
+                )
+                team_profiles = self._resolve_multi_team_profiles(requested_conns)
+                self._validate_multi_team_mode(team_profiles)
+            connected_for_start = [
+                conn for conn in requested_conns if conn.gun.is_connected
+            ]
+            disconnected_conns = [
+                conn for conn in requested_conns if not conn.gun.is_connected
+            ]
             prepared = [
                 {
                     "address": conn.address,
@@ -979,12 +1199,9 @@ class BleHub:
             failures: list[dict[str, str]] = [
                 {
                     "address": conn.address,
-                    "error": reconnect_errors.get(
-                        conn.address.lower(),
-                        (
-                            "ConnectionError: device not connected at multi-start "
-                            f"(state={conn.connection_state})"
-                        ),
+                    "error": (
+                        "ConnectionError: device not connected at multi-start "
+                        f"(state={conn.connection_state})"
                     ),
                 }
                 for conn in disconnected_conns
@@ -1042,6 +1259,7 @@ class BleHub:
                 "started": started,
                 "failures": failures,
                 "ranking": ranking_snapshot,
+                "recycle": recycle_result,
             }
 
     async def poll_status(self, address: str) -> str:
@@ -1174,6 +1392,22 @@ class BleHub:
             raise LookupError(f"device is not connected: {address}")
         return conn
 
+    async def _persist_connection_local_profile(self, conn: ConnectionState) -> None:
+        key = self._normalize_address(conn.address).lower()
+        async with self._local_names_lock:
+            if conn.local_name:
+                self._local_names[key] = conn.local_name
+            if conn.assigned_slot is not None and conn.assigned_team is not None:
+                self._local_team_profiles[key] = (
+                    int(conn.assigned_slot),
+                    int(conn.assigned_team),
+                )
+            try:
+                self._save_local_name_store()
+            except Exception:
+                # Disconnects should not be blocked by a local preference write.
+                pass
+
     async def _resolve_connections(
         self, addresses: list[str] | None
     ) -> list[ConnectionState]:
@@ -1195,6 +1429,156 @@ class BleHub:
         if not selected:
             raise LookupError("no connected devices")
         return sorted(selected, key=lambda x: x.address.lower())
+
+    async def _should_recycle_for_followup_round_start(self) -> bool:
+        async with self._game_session_lock:
+            if self._game_session_counter <= 0:
+                return False
+            session = self._game_session
+            if session is None:
+                return True
+            return bool(session.final_snapshot is not None or session.status == "ended")
+
+    async def _recycle_connections_for_followup_start(
+        self,
+        *,
+        conns: list[ConnectionState],
+        team_profiles: dict[str, tuple[int, int]],
+    ) -> tuple[list[ConnectionState], dict[str, Any]]:
+        targets = sorted(conns, key=lambda conn: conn.address.lower())
+        reconnect_targets: list[dict[str, Any]] = []
+        for conn in targets:
+            key = conn.address.lower()
+            slot, team = team_profiles[key]
+            conn.assigned_slot = int(slot)
+            conn.assigned_team = int(team)
+            reconnect_targets.append(
+                {
+                    "address": conn.address,
+                    "name": conn.name,
+                    "local_name": conn.local_name,
+                    "display_name": self._display_name(conn),
+                    "slot": int(slot),
+                    "team": int(team),
+                    "auto_reconnect": bool(conn.auto_reconnect),
+                }
+            )
+
+        async with self._connections_lock:
+            for item in reconnect_targets:
+                self._connections.pop(str(item["address"]).lower(), None)
+
+        disconnect_failures: list[dict[str, str]] = []
+        for conn in targets:
+            conn.desired_connected = False
+            conn.connection_state = "disconnected"
+            conn.last_disconnect_reason = "round_recycle"
+            conn.last_disconnect_at = time.time()
+            reconnect_task = conn.reconnect_task
+            self._cancel_reconnect_task(conn)
+            if reconnect_task is not None and not reconnect_task.done():
+                try:
+                    await asyncio.wait_for(
+                        reconnect_task,
+                        timeout=FOLLOWUP_ROUND_RECYCLE_CANCEL_TIMEOUT_SECONDS,
+                    )
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    pass
+            await self._persist_connection_local_profile(conn)
+            try:
+                await conn.gun.__aexit__(None, None, None)
+            except Exception as exc:
+                disconnect_failures.append(
+                    {"address": conn.address, "error": self._format_error(exc)}
+                )
+            self._schedule_event(
+                "connection",
+                {
+                    "action": "disconnected",
+                    "reason": "round_recycle",
+                    "address": conn.address,
+                    "name": conn.name,
+                    "local_name": conn.local_name,
+                    "display_name": self._display_name(conn),
+                    "connection_state": conn.connection_state,
+                },
+            )
+
+        wait_seconds = FOLLOWUP_ROUND_RECYCLE_WAIT_SECONDS
+        self._schedule_event(
+            "connection",
+            {
+                "action": "round_recycle_wait",
+                "address": "",
+                "display_name": "Folgerunde",
+                "connection_state": "recycling",
+                "count": len(reconnect_targets),
+                "wait_seconds": wait_seconds,
+            },
+        )
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
+
+        connected: list[ConnectionState] = []
+        reconnect_failures: list[dict[str, str]] = []
+        for item in reconnect_targets:
+            address = str(item["address"])
+            last_exc: Exception | None = None
+            for attempt in range(1, FOLLOWUP_ROUND_RECYCLE_CONNECT_ATTEMPTS + 1):
+                try:
+                    await self._connect_serialized(
+                        address,
+                        timeout=FOLLOWUP_ROUND_RECYCLE_CONNECT_TIMEOUT,
+                    )
+                    conn = await self._get(address)
+                    conn.assigned_slot = int(item["slot"])
+                    conn.assigned_team = int(item["team"])
+                    conn.auto_reconnect = bool(item["auto_reconnect"])
+                    await self._persist_connection_local_profile(conn)
+                    connected.append(conn)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    self._schedule_event(
+                        "connection",
+                        {
+                            "action": "round_recycle_reconnect_failed",
+                            "address": address,
+                            "name": item.get("name"),
+                            "local_name": item.get("local_name"),
+                            "display_name": item.get("display_name"),
+                            "attempt": attempt,
+                            "error": self._format_error(exc),
+                        },
+                    )
+                    if attempt < FOLLOWUP_ROUND_RECYCLE_CONNECT_ATTEMPTS:
+                        await asyncio.sleep(
+                            FOLLOWUP_ROUND_RECYCLE_RETRY_DELAY_SECONDS
+                        )
+            if last_exc is not None:
+                reconnect_failures.append(
+                    {"address": address, "error": self._format_error(last_exc)}
+                )
+
+        result = {
+            "enabled": True,
+            "wait_seconds": wait_seconds,
+            "requested_count": len(reconnect_targets),
+            "connected_count": len(connected),
+            "disconnect_failures": disconnect_failures,
+            "reconnect_failures": reconnect_failures,
+        }
+        if reconnect_failures:
+            detail = "; ".join(
+                f"{item['address']}: {item['error']}" for item in reconnect_failures
+            )
+            raise ValueError(f"follow-up round reconnect failed: {detail}")
+        return sorted(connected, key=lambda conn: conn.address.lower()), result
 
     def _normalize_address(self, address: str) -> str:
         normalized = address.strip()
@@ -1232,6 +1616,14 @@ class BleHub:
                 )
 
         def _on_write(payload: bytes) -> None:
+            cfg = _extract_config_write_profile(payload)
+            if cfg is not None:
+                conn.live_state["configured_ammo_profile"] = int(
+                    cfg["ammo_profile"]
+                )
+                conn.live_state["configured_health_profile"] = int(
+                    cfg["health_profile"]
+                )
             self._schedule_event(
                 "tx_packet",
                 {
@@ -1265,20 +1657,31 @@ class BleHub:
     ) -> None:
         if not conn.desired_connected:
             return
-        conn.connection_state = "disconnected"
+        now = time.time()
+        is_team_confirmation = (
+            reason == "link_lost"
+            and conn.last_game_start_at is not None
+            and (now - conn.last_game_start_at)
+            <= TEAM_CONFIRMATION_LINK_LOSS_WINDOW_SECONDS
+        )
+        event_action = "team_confirmation_wait" if is_team_confirmation else "lost"
+        event_reason = "team_confirmation" if is_team_confirmation else reason
+        conn.connection_state = (
+            "awaiting_team_confirmation" if is_team_confirmation else "disconnected"
+        )
         conn.disconnect_count += 1
-        conn.last_disconnect_at = time.time()
-        conn.last_disconnect_reason = reason
+        conn.last_disconnect_at = now
+        conn.last_disconnect_reason = event_reason
         self._schedule_event(
             "connection",
             {
-                "action": "lost",
+                "action": event_action,
                 "address": conn.address,
                 "name": conn.name,
                 "local_name": conn.local_name,
                 "display_name": self._display_name(conn),
                 "connection_state": conn.connection_state,
-                "reason": reason,
+                "reason": event_reason,
                 "disconnect_count": conn.disconnect_count,
             },
         )
@@ -1424,7 +1827,8 @@ class BleHub:
                     write_callback=write_cb,
                 )
                 try:
-                    await trial_gun.__aenter__()
+                    async with self._connect_lock:
+                        await trial_gun.__aenter__()
                 except Exception as exc:
                     last_exc = exc
                     try:
@@ -1481,12 +1885,27 @@ class BleHub:
     ) -> dict[str, Any]:
         safe_duration = self._validate_game_duration(duration_seconds)
         participant_keys = sorted({conn.address.lower() for conn in participants})
+        for conn in participants:
+            start_life = conn._configured_start_life()
+            if start_life is not None:
+                conn.live_state["last_life_counter"] = start_life
+                conn.live_state["last_life_delta"] = 0
+                conn.live_state["life_reset_source"] = "game_start"
+            conn.live_state["current_life_damage_by_attacker_slot"] = {}
+            conn.live_state["last_life_assist_slots"] = []
+        baseline_shots: dict[str, int] = {}
         baseline_triggers: dict[str, int] = {}
         baseline_reloads: dict[str, int] = {}
+        baseline_life_slot_stats = self._aggregate_life_slot_stats(participants)
+        baseline_round_shot_reports: dict[str, int] = {}
         for conn in participants:
             key = conn.address.lower()
+            baseline_shots[key] = self._live_shot_count(conn)
             baseline_triggers[key] = int(conn.live_state.get("trigger_count", 0) or 0)
             baseline_reloads[key] = int(conn.live_state.get("reload_count", 0) or 0)
+            baseline_round_shot_reports[key] = int(
+                conn.live_state.get("round_shots_report_count", 0) or 0
+            )
 
         started_at = time.time()
         planned_end_at = started_at + float(safe_duration)
@@ -1501,8 +1920,11 @@ class BleHub:
                 duration_seconds=safe_duration,
                 planned_end_at=planned_end_at,
                 participant_keys=participant_keys,
+                baseline_shots=baseline_shots,
                 baseline_triggers=baseline_triggers,
                 baseline_reloads=baseline_reloads,
+                baseline_life_slot_stats=baseline_life_slot_stats,
+                baseline_round_shot_reports=baseline_round_shot_reports,
             )
 
         self._arm_game_end_task(session_id=session_id, planned_end_at=planned_end_at)
@@ -1604,6 +2026,13 @@ class BleHub:
             if key in active_connections
         ]
 
+        if reason == "duration_elapsed":
+            session_copy.round_shot_wait = await self._wait_for_round_shot_reports(
+                session=session_copy,
+                participant_connections=participant_connections,
+                timeout=AUTO_END_ROUND_SHOTS_GRACE_SECONDS,
+            )
+
         close_failures: list[dict[str, str]] = []
         if send_close:
             for conn in participant_connections:
@@ -1643,6 +2072,10 @@ class BleHub:
         session_copy.ended_at = ended_at
         session_copy.end_reason = reason
         session_copy.final_slot_stats = slot_stats_map
+        session_copy.final_round_shots = self._collect_round_shot_reports(
+            session=session_copy,
+            participant_connections=participant_connections,
+        )
         final_snapshot = self._build_session_snapshot(
             session=session_copy,
             active_connections=active_connections,
@@ -1663,6 +2096,12 @@ class BleHub:
                 live_session.ended_at = ended_at
                 live_session.end_reason = reason
                 live_session.final_slot_stats = dict(slot_stats_map)
+                live_session.final_round_shots = copy.deepcopy(
+                    session_copy.final_round_shots
+                )
+                live_session.round_shot_wait = copy.deepcopy(
+                    session_copy.round_shot_wait
+                )
                 live_session.final_snapshot = copy.deepcopy(final_snapshot)
                 final_snapshot = copy.deepcopy(live_session.final_snapshot)
             elif live_session is not None and live_session.final_snapshot is not None:
@@ -1684,6 +2123,66 @@ class BleHub:
             },
         )
         return final_snapshot
+
+    async def _wait_for_round_shot_reports(
+        self,
+        *,
+        session: GameSessionState,
+        participant_connections: list[ConnectionState],
+        timeout: float,
+    ) -> dict[str, Any]:
+        started = time.time()
+        timeout_seconds = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout_seconds
+
+        def _missing() -> list[str]:
+            missing: list[str] = []
+            for conn in participant_connections:
+                key = conn.address.lower()
+                baseline = int(
+                    session.baseline_round_shot_reports.get(key, 0) or 0
+                )
+                current = int(
+                    conn.live_state.get("round_shots_report_count", 0) or 0
+                )
+                if current <= baseline:
+                    missing.append(conn.address)
+            return missing
+
+        missing = _missing()
+        while missing and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            missing = _missing()
+
+        return {
+            "waited_seconds": round(time.time() - started, 3),
+            "timeout_seconds": timeout_seconds,
+            "complete": not missing,
+            "missing": missing,
+        }
+
+    def _collect_round_shot_reports(
+        self,
+        *,
+        session: GameSessionState,
+        participant_connections: list[ConnectionState],
+    ) -> dict[str, dict[str, Any]]:
+        reports: dict[str, dict[str, Any]] = {}
+        for conn in participant_connections:
+            key = conn.address.lower()
+            baseline = int(session.baseline_round_shot_reports.get(key, 0) or 0)
+            current = int(conn.live_state.get("round_shots_report_count", 0) or 0)
+            if current <= baseline:
+                continue
+            reports[key] = {
+                "address": conn.address,
+                "display_name": self._display_name(conn),
+                "shots": conn.live_state.get("last_round_shots"),
+                "raw": conn.live_state.get("last_round_shots_raw"),
+                "ts": conn.live_state.get("last_round_shots_ts"),
+                "report_count": current - baseline,
+            }
+        return reports
 
     async def _collect_round_slot_stats(
         self,
@@ -1835,7 +2334,15 @@ class BleHub:
             "participants": [],
             "ranking": [],
             "slot_stats": [],
-            "totals": {"shots": 0, "reloads": 0, "hits": None, "kills": None},
+            "round_shots": [],
+            "round_shot_wait": None,
+            "totals": {
+                "shots": 0,
+                "reloads": 0,
+                "hits": None,
+                "kills": None,
+                "assists": None,
+            },
             "stats_source_address": None,
             "stats_error": None,
             "close_failures": [],
@@ -1859,6 +2366,7 @@ class BleHub:
         totals_reloads = sum(int(item.get("reloads", 0) or 0) for item in ranking)
         has_hits = any(item.get("hits") is not None for item in ranking)
         has_kills = any(item.get("kills") is not None for item in ranking)
+        has_assists = any(item.get("assists") is not None for item in ranking)
         totals_hits = (
             sum(int(item.get("hits", 0) or 0) for item in ranking) if has_hits else None
         )
@@ -1867,10 +2375,35 @@ class BleHub:
             if has_kills
             else None
         )
+        totals_assists = (
+            sum(int(item.get("assists", 0) or 0) for item in ranking)
+            if has_assists
+            else None
+        )
+        life_slot_stats = self._session_life_slot_stats(
+            session=session,
+            active_connections=active_connections,
+        )
         slot_stats_rows: list[dict[str, Any]] = []
-        if session.final_slot_stats:
-            for slot in sorted(session.final_slot_stats):
-                stats = session.final_slot_stats[slot]
+        row_slots = set(session.final_slot_stats)
+        for key in session.participant_keys:
+            conn = active_connections.get(key)
+            if conn is not None and conn.assigned_slot is not None:
+                row_slots.add(int(conn.assigned_slot))
+        if row_slots:
+            for slot in sorted(row_slots):
+                stats = session.final_slot_stats.get(
+                    slot, {"hits": 0, "kills": 0, "assists": 0}
+                )
+                life_stats = life_slot_stats.get(slot)
+                source = "round_slot_stats"
+                if life_stats is not None and (
+                    int(life_stats.get("hits", 0) or 0) > 0
+                    or int(life_stats.get("kills", 0) or 0) > 0
+                    or int(life_stats.get("assists", 0) or 0) > 0
+                ):
+                    stats = life_stats
+                    source = "life_delta"
                 mapped_conn: ConnectionState | None = None
                 for key in session.participant_keys:
                     conn = active_connections.get(key)
@@ -1884,11 +2417,13 @@ class BleHub:
                         "slot": int(slot),
                         "hits": int(stats.get("hits", 0)),
                         "kills": int(stats.get("kills", 0)),
+                        "assists": int(stats.get("assists", 0)),
                         "address": mapped_conn.address if mapped_conn else None,
                         "display_name": self._display_name(mapped_conn)
                         if mapped_conn is not None
                         else None,
                         "team": mapped_conn.assigned_team if mapped_conn else None,
+                        "source": source,
                     }
                 )
         participants = [
@@ -1896,6 +2431,12 @@ class BleHub:
             for key in session.participant_keys
             if key in active_connections
         ]
+        round_shot_rows: list[dict[str, Any]] = []
+        for key in session.participant_keys:
+            report = session.final_round_shots.get(key)
+            if not report:
+                continue
+            round_shot_rows.append(copy.deepcopy(report))
         remaining_seconds = None
         if running:
             remaining_seconds = max(
@@ -1915,16 +2456,106 @@ class BleHub:
             "participants": participants,
             "ranking": ranking,
             "slot_stats": slot_stats_rows,
+            "round_shots": round_shot_rows,
+            "round_shot_wait": copy.deepcopy(session.round_shot_wait),
             "totals": {
                 "shots": totals_shots,
                 "reloads": totals_reloads,
                 "hits": totals_hits,
                 "kills": totals_kills,
+                "assists": totals_assists,
             },
             "stats_source_address": stats_source_address,
             "stats_error": stats_error,
             "close_failures": close_failures or [],
         }
+
+    @staticmethod
+    def _live_shot_count(conn: ConnectionState) -> int:
+        state = conn.live_state
+        try:
+            shot_count = int(state.get("shot_count", 0) or 0)
+        except (TypeError, ValueError):
+            shot_count = 0
+        if state.get("shot_count_source") == "ammo_delta" or shot_count > 0:
+            return max(0, shot_count)
+        try:
+            return max(0, int(state.get("trigger_count", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _coerce_slot_counter_map(raw: Any) -> dict[int, int]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[int, int] = {}
+        for key, value in raw.items():
+            try:
+                slot = int(key)
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if slot > 0 and count > 0:
+                out[slot] = out.get(slot, 0) + count
+        return out
+
+    def _aggregate_life_slot_stats(
+        self,
+        connections: list[ConnectionState],
+    ) -> dict[int, dict[str, int]]:
+        stats: dict[int, dict[str, int]] = {}
+        for conn in connections:
+            hits_by_slot = self._coerce_slot_counter_map(
+                conn.live_state.get("received_hits_by_attacker_slot")
+            )
+            kills_by_slot = self._coerce_slot_counter_map(
+                conn.live_state.get("received_kills_by_attacker_slot")
+            )
+            assists_by_slot = self._coerce_slot_counter_map(
+                conn.live_state.get("received_assists_by_attacker_slot")
+            )
+            for slot in set(hits_by_slot) | set(kills_by_slot) | set(assists_by_slot):
+                bucket = stats.setdefault(slot, {"hits": 0, "kills": 0, "assists": 0})
+                bucket["hits"] += int(hits_by_slot.get(slot, 0) or 0)
+                bucket["kills"] += int(kills_by_slot.get(slot, 0) or 0)
+                bucket["assists"] += int(assists_by_slot.get(slot, 0) or 0)
+        return stats
+
+    def _session_life_slot_stats(
+        self,
+        *,
+        session: GameSessionState,
+        active_connections: dict[str, ConnectionState],
+    ) -> dict[int, dict[str, int]]:
+        conns = [
+            active_connections[key]
+            for key in session.participant_keys
+            if key in active_connections
+        ]
+        current = self._aggregate_life_slot_stats(conns)
+        out: dict[int, dict[str, int]] = {}
+        for slot, stats in current.items():
+            baseline = session.baseline_life_slot_stats.get(
+                int(slot), {"hits": 0, "kills": 0, "assists": 0}
+            )
+            hits = max(
+                0,
+                int(stats.get("hits", 0) or 0)
+                - int(baseline.get("hits", 0) or 0),
+            )
+            kills = max(
+                0,
+                int(stats.get("kills", 0) or 0)
+                - int(baseline.get("kills", 0) or 0),
+            )
+            assists = max(
+                0,
+                int(stats.get("assists", 0) or 0)
+                - int(baseline.get("assists", 0) or 0),
+            )
+            if hits > 0 or kills > 0 or assists > 0:
+                out[int(slot)] = {"hits": hits, "kills": kills, "assists": assists}
+        return out
 
     def _build_ranking_entries(
         self,
@@ -1934,14 +2565,19 @@ class BleHub:
     ) -> list[dict[str, Any]]:
         ranking: list[dict[str, Any]] = []
         slot_stats = session.final_slot_stats or {}
+        life_slot_stats = self._session_life_slot_stats(
+            session=session,
+            active_connections=active_connections,
+        )
 
         for key in session.participant_keys:
             conn = active_connections.get(key)
             if conn is None:
                 continue
+            shot_now = self._live_shot_count(conn)
             trigger_now = int(conn.live_state.get("trigger_count", 0) or 0)
             reload_now = int(conn.live_state.get("reload_count", 0) or 0)
-            shots = max(0, trigger_now - int(session.baseline_triggers.get(key, 0)))
+            shots = max(0, shot_now - int(session.baseline_shots.get(key, 0)))
             reloads = max(0, reload_now - int(session.baseline_reloads.get(key, 0)))
             slot = conn.assigned_slot
             slot_stat = (
@@ -1949,10 +2585,23 @@ class BleHub:
             )
             hits = None
             kills = None
+            assists = None
             accuracy = None
-            if slot_stat is not None:
+            hit_stats_source = None
+            life_stat = life_slot_stats.get(int(slot)) if slot is not None else None
+            if life_stat is not None:
+                hits = int(life_stat.get("hits", 0))
+                kills = int(life_stat.get("kills", 0))
+                assists = int(life_stat.get("assists", 0))
+                hit_stats_source = "life_delta"
+                if shots > 0:
+                    accuracy = round((hits / shots) * 100.0, 1)
+            elif slot_stat is not None:
                 hits = int(slot_stat.get("hits", 0))
                 kills = int(slot_stat.get("kills", 0))
+                if "assists" in slot_stat:
+                    assists = int(slot_stat.get("assists", 0))
+                hit_stats_source = "round_slot_stats"
                 if shots > 0:
                     accuracy = round((hits / shots) * 100.0, 1)
             ranking.append(
@@ -1967,8 +2616,12 @@ class BleHub:
                     "reloads": reloads,
                     "hits": hits,
                     "kills": kills,
+                    "assists": assists,
                     "accuracy_percent": accuracy,
+                    "hit_stats_source": hit_stats_source,
                     "connection_state": conn.connection_state,
+                    "last_disconnect_reason": conn.last_disconnect_reason,
+                    "last_error": conn.last_error,
                 }
             )
 
@@ -1977,6 +2630,7 @@ class BleHub:
             ranking.sort(
                 key=lambda item: (
                     -int(item["kills"] if item["kills"] is not None else -1),
+                    -int(item["assists"] if item["assists"] is not None else -1),
                     -int(item["hits"] if item["hits"] is not None else -1),
                     -int(item["shots"]),
                     int(item["reloads"]),
@@ -2018,40 +2672,69 @@ class BleHub:
             )
         return value
 
-    def _load_local_name_store(self) -> dict[str, str]:
+    def _load_local_name_store(
+        self,
+    ) -> tuple[dict[str, str], dict[str, tuple[int, int]]]:
         if not self._local_name_store_path.exists():
-            return {}
+            return {}, {}
         try:
             payload = json.loads(self._local_name_store_path.read_text(encoding="utf-8"))
         except Exception:
-            return {}
+            return {}, {}
         if not isinstance(payload, dict):
-            return {}
+            return {}, {}
 
         names: dict[str, str] = {}
-        for raw_address, raw_name in payload.items():
+        team_profiles: dict[str, tuple[int, int]] = {}
+        for raw_address, raw_value in payload.items():
             if not isinstance(raw_address, str):
-                continue
-            if not isinstance(raw_name, str):
                 continue
             try:
                 key = self._normalize_address(raw_address).lower()
             except Exception:
                 continue
-            safe_name = self._normalize_local_name(raw_name)
-            if safe_name is None:
+
+            if isinstance(raw_value, str):
+                safe_name = self._normalize_local_name(raw_value)
+                if safe_name is not None:
+                    names[key] = safe_name
                 continue
-            names[key] = safe_name
-        return names
+
+            if not isinstance(raw_value, dict):
+                continue
+
+            safe_name = self._normalize_local_name(raw_value.get("local_name"))
+            if safe_name is not None:
+                names[key] = safe_name
+
+            try:
+                safe_slot, safe_team = self._validate_safe_team(
+                    slot=int(raw_value.get("slot")),
+                    team=int(raw_value.get("team")),
+                )
+            except Exception:
+                continue
+            team_profiles[key] = (safe_slot, safe_team)
+        return names, team_profiles
 
     def _save_local_name_store(self) -> None:
         path = self._local_name_store_path
         tmp_path = path.with_suffix(path.suffix + ".tmp")
-        payload_map = {
-            str(address): str(name)
-            for address, name in sorted(self._local_names.items())
-            if name
-        }
+        payload_map: dict[str, dict[str, Any]] = {}
+        for address in sorted(
+            set(self._local_names.keys()) | set(self._local_team_profiles.keys())
+        ):
+            item: dict[str, Any] = {}
+            name = self._local_names.get(address)
+            if name:
+                item["local_name"] = str(name)
+            team_profile = self._local_team_profiles.get(address)
+            if team_profile is not None:
+                slot, team = team_profile
+                item["slot"] = int(slot)
+                item["team"] = int(team)
+            if item:
+                payload_map[str(address)] = item
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(
@@ -2141,7 +2824,11 @@ class BleHub:
     ) -> tuple[int, int]:
         selected_slot = conn.assigned_slot if slot is None else slot
         selected_team = conn.assigned_team if team is None else team
-        if selected_slot is None:
+        if (
+            selected_slot is None
+            or int(selected_slot) < SAFE_SLOT_MIN
+            or int(selected_slot) > SAFE_SLOT_MAX
+        ):
             selected_slot = SAFE_SLOT_MIN
         if selected_team is None:
             selected_team = self._default_team_for_slot(selected_slot)
@@ -2175,10 +2862,7 @@ class BleHub:
                 safe_slot = raw_slot
                 safe_team = raw_team
             if safe_slot in used:
-                raise ValueError(
-                    "duplicate slot assignment in connected set: "
-                    f"slot {safe_slot} (including {conn.address})"
-                )
+                continue
             profiles[conn.address.lower()] = (safe_slot, safe_team)
             used.add(safe_slot)
 
@@ -2292,7 +2976,7 @@ class BleHub:
                 startup_volume=startup_volume,
                 delay=delay,
                 duration_seconds=duration_seconds,
-                allow_reconnect=True,
+                allow_reconnect=False,
                 reconnect_timeout=SAFE_MULTI_RECONNECT_TIMEOUT,
             )
             conn.last_snapshot = _snapshot_to_dict(snapshot)

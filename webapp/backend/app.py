@@ -51,7 +51,7 @@ class GameStartRequest(BaseModel):
     startup_volume: int = Field(default=0, ge=0, le=31)
     force_startup: bool = True
     duration_seconds: int = Field(default=300, ge=30, le=3600)
-    slot: int | None = Field(default=None, ge=2, le=5)
+    slot: int | None = Field(default=None, ge=1, le=10)
     team: int | None = Field(default=None, ge=0, le=2)
 
 
@@ -61,6 +61,7 @@ class MultiGameStartRequest(BaseModel):
     startup_volume: int = Field(default=1, ge=0, le=31)
     force_startup: bool = True
     duration_seconds: int = Field(default=300, ge=30, le=3600)
+    auto_recycle_followup: bool = True
 
 
 class GameEndRequest(BaseModel):
@@ -68,7 +69,7 @@ class GameEndRequest(BaseModel):
 
 
 class TeamProfileRequest(BaseModel):
-    slot: int = Field(ge=2, le=5)
+    slot: int = Field(ge=1, le=10)
     team: int = Field(ge=0, le=2)
 
 
@@ -449,6 +450,7 @@ async def start_game_multi(
             delay=body.delay,
             force_startup=body.force_startup,
             duration_seconds=body.duration_seconds,
+            auto_recycle_followup=body.auto_recycle_followup,
         )
     except Exception as exc:
         raise _as_http_error(exc) from exc

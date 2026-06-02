@@ -16,6 +16,7 @@ const rankingStatePill = document.getElementById("ranking-state");
 const roundStatsBody = document.getElementById("round-stats-body");
 const gameSummaryPill = document.getElementById("game-summary");
 const languageSelect = document.getElementById("language-select");
+const adminModeButton = document.getElementById("btn-admin-mode");
 const SLOT_MIN = 1;
 const SLOT_MAX = 10;
 const LEVEL_MIN = 1;
@@ -28,6 +29,7 @@ if (enableBluetoothButton) {
 
 const SUPPORTED_LANGUAGES = ["en", "de"];
 const DEFAULT_LANGUAGE = "en";
+const ASSET_VERSION = "2026-06-02-admin-mode";
 let currentLanguage = DEFAULT_LANGUAGE;
 let translations = {
   "app.title": "LaserOps Control",
@@ -48,11 +50,14 @@ let translations = {
   "button.saveLevel": "Save level",
   "button.saveConfig": "Save config",
   "button.resetConfig": "Reset config",
+  "button.adminEnable": "Enable admin",
+  "button.adminDisable": "Disable admin",
   "button.connecting": "Connecting...",
   "label.healthProfile": "Health (0-255)",
   "label.damageProfile": "Damage (0-255)",
   "label.ammoProfile": "Ammo (0-255)",
   "confirm.resetConfig": "Reset this blaster to default level/profile values?",
+  "context.adminMode": "Admin mode",
   "misc.empty": "-",
 };
 
@@ -68,7 +73,9 @@ function languageFileFor(lang) {
 
 async function loadLanguage(lang) {
   const safeLang = SUPPORTED_LANGUAGES.includes(lang) ? lang : DEFAULT_LANGUAGE;
-  const response = await fetch(`/assets/i18n/${languageFileFor(safeLang)}`);
+  const response = await fetch(
+    `/assets/i18n/${languageFileFor(safeLang)}?v=${encodeURIComponent(ASSET_VERSION)}`
+  );
   if (!response.ok) {
     throw new Error(`Failed to load translations for ${safeLang}`);
   }
@@ -92,6 +99,19 @@ function t(key, vars = {}) {
   return interpolate(template, vars);
 }
 
+function pathNameFor(path) {
+  try {
+    return new URL(path, window.location.origin).pathname;
+  } catch (_err) {
+    return String(path || "").split("?")[0];
+  }
+}
+
+function isProtectedApiPath(path) {
+  const pathname = pathNameFor(path);
+  return pathname.startsWith("/api/") && !PUBLIC_API_PATHS.has(pathname);
+}
+
 function applyTranslations() {
   document.querySelectorAll("[data-i18n]").forEach((el) => {
     el.textContent = t(el.dataset.i18n);
@@ -104,6 +124,7 @@ function applyTranslations() {
   setConnectBusy(connectBusy);
   renderErrors();
   renderCachedDevices();
+  updateAdminModeUI();
 }
 
 let liveSource = null;
@@ -114,7 +135,15 @@ const MAX_LIVE_LINES = 2000;
 const LIVE_SEPARATOR = "----------------------------------------";
 const errorEntries = [];
 const MAX_ERROR_LINES = 100;
+const ADMIN_TOKEN_STORAGE_KEY = "laserops.adminToken";
+const PUBLIC_API_PATHS = new Set([
+  "/api/health",
+  "/api/server/restart-status",
+  "/api/game/ranking",
+  "/api/game/ranking/",
+]);
 const errorLastSeenByFingerprint = new Map();
+let adminTokenPromptPromise = null;
 let scanBusy = false;
 let scanBusyTimer = null;
 let connectBusy = false;
@@ -187,6 +216,15 @@ function localizeErrorDetail(detail, status) {
   }
   if (lower.includes("no supported bluetooth control utility found")) {
     return t("error.bluetoothToolsMissing");
+  }
+  if (
+    lower.includes("api access is disabled") ||
+    lower.includes("set laserops_admin_token")
+  ) {
+    return t("error.backendApiDisabled");
+  }
+  if (lower.includes("invalid admin token")) {
+    return t("error.adminTokenInvalid");
   }
   if (
     lower.includes("bluetooth discovery already running") ||
@@ -352,10 +390,20 @@ function setRankingState(text, ok = true) {
 
 async function api(path, options = {}) {
   let response;
+  const { skipAuth = false, ...fetchOptions } = options;
+  const protectedApi = !skipAuth && isProtectedApiPath(path);
+  const adminToken = protectedApi ? await requireAdminTokenForApi() : "";
+  const headers = {
+    "Content-Type": "application/json",
+    ...(fetchOptions.headers || {}),
+  };
+  if (adminToken) {
+    headers["X-LaserOps-Admin-Token"] = adminToken;
+  }
   try {
     response = await fetch(path, {
-      headers: { "Content-Type": "application/json" },
-      ...options,
+      ...fetchOptions,
+      headers,
     });
   } catch (networkErr) {
     const err = new Error(networkErr?.message || "failed to fetch");
@@ -381,9 +429,133 @@ async function api(path, options = {}) {
     err.status = response.status;
     err.detail = detail;
     err.path = path;
+    if (protectedApi && response.status === 403) {
+      clearStoredAdminToken();
+      updateAdminModeUI();
+    }
     throw err;
   }
   return data ?? {};
+}
+
+function getStoredAdminToken() {
+  try {
+    return String(window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || "").trim();
+  } catch (_err) {
+    return "";
+  }
+}
+
+function hasAdminToken() {
+  return Boolean(getStoredAdminToken());
+}
+
+function storeAdminToken(token) {
+  try {
+    window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+  } catch (_err) {
+    // The current request can still proceed; persistence is only convenience.
+  }
+}
+
+function clearStoredAdminToken() {
+  try {
+    window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  } catch (_err) {
+    // Ignore storage errors.
+  }
+}
+
+async function requireAdminTokenForApi() {
+  const storedToken = getStoredAdminToken();
+  if (storedToken) {
+    return storedToken;
+  }
+  const err = new Error(t("error.adminTokenRequired"));
+  err.status = 403;
+  err.detail = t("error.adminTokenRequired");
+  throw err;
+}
+
+async function promptForAdminToken() {
+  if (adminTokenPromptPromise) {
+    return adminTokenPromptPromise;
+  }
+  adminTokenPromptPromise = promptForAdminTokenOnce();
+  try {
+    return await adminTokenPromptPromise;
+  } finally {
+    adminTokenPromptPromise = null;
+  }
+}
+
+async function promptForAdminTokenOnce() {
+  const adminToken = window.prompt(t("prompt.adminToken"));
+  if (adminToken === null) {
+    const err = new Error(t("error.adminTokenRequired"));
+    err.status = 403;
+    err.detail = t("error.adminTokenRequired");
+    throw err;
+  }
+  const trimmedAdminToken = adminToken.trim();
+  if (!trimmedAdminToken) {
+    const err = new Error(t("error.adminTokenRequired"));
+    err.status = 403;
+    err.detail = t("error.adminTokenRequired");
+    throw err;
+  }
+  return trimmedAdminToken;
+}
+
+async function verifyAdminToken(token) {
+  return api("/api/auth/check", {
+    skipAuth: true,
+    headers: { "X-LaserOps-Admin-Token": token },
+  });
+}
+
+function updateAdminModeUI() {
+  const active = hasAdminToken();
+  document.body.classList.toggle("admin-active", active);
+  document.querySelectorAll("[data-admin-only]").forEach((el) => {
+    el.classList.toggle("admin-hidden", !active);
+  });
+  if (adminModeButton) {
+    adminModeButton.textContent = active ? t("button.adminDisable") : t("button.adminEnable");
+  }
+  if (!active) {
+    if (liveSource) {
+      liveSource.close();
+      liveSource = null;
+    }
+    setLiveState(t("status.liveOff"), true);
+    if (currentView !== "game") {
+      activateView("game");
+    }
+  }
+}
+
+async function activateAdminMode() {
+  const token = await promptForAdminToken();
+  await verifyAdminToken(token);
+  storeAdminToken(token);
+  updateAdminModeUI();
+  await refreshConnections();
+  await openLiveStream();
+  return { status: "admin_enabled" };
+}
+
+function deactivateAdminMode() {
+  clearStoredAdminToken();
+  updateAdminModeUI();
+  return { status: "admin_disabled" };
+}
+
+async function toggleAdminMode() {
+  if (hasAdminToken()) {
+    return deactivateAdminMode();
+  }
+  return activateAdminMode();
 }
 
 function getTargetAddress() {
@@ -1556,14 +1728,17 @@ function setBluetoothEnableButtonVisibility(health) {
   enableBluetoothButton.classList.toggle("hidden", !shouldShow);
 }
 
-function openLiveStream() {
+async function openLiveStream() {
   if (liveSource) {
     liveSource.close();
     liveSource = null;
   }
 
   setLiveState(t("status.liveConnecting"), true);
-  liveSource = new EventSource("/api/live/stream");
+  const adminToken = await requireAdminTokenForApi();
+  liveSource = new EventSource(
+    `/api/live/stream?admin_token=${encodeURIComponent(adminToken)}`
+  );
 
   liveSource.addEventListener("open", () => {
     setLiveState(t("status.liveConnected"), true);
@@ -1792,7 +1967,6 @@ async function restartBackend() {
   if (!confirmed) {
     return { status: "cancelled" };
   }
-
   const result = await api("/api/server/restart", {
     method: "POST",
     body: JSON.stringify({}),
@@ -1813,7 +1987,7 @@ async function restartBackend() {
     throw err;
   }
 
-  openLiveStream();
+  await openLiveStream();
   await refreshConnections();
   await refreshRanking();
   return result;
@@ -2073,6 +2247,9 @@ async function runAction(fn, options = {}) {
 }
 
 function activateView(view) {
+  if (!hasAdminToken() && view !== "game") {
+    view = "game";
+  }
   currentView = view;
   for (const btn of document.querySelectorAll(".tab-btn")) {
     btn.classList.toggle("active", btn.dataset.viewTarget === view);
@@ -2081,7 +2258,7 @@ function activateView(view) {
     const isVisible = pane.dataset.view === view;
     pane.classList.toggle("hidden", !isVisible);
   }
-  if (view === "setup") {
+  if (view === "setup" && hasAdminToken()) {
     refreshConnections().catch((err) => {
       reportError(err, { contextKey: "context.viewSetup", dedupeMs: 10000 });
     });
@@ -2115,6 +2292,14 @@ if (enableBluetoothButton) {
       button: enableBluetoothButton,
       busyText: t("button.enablingBluetooth"),
       contextKey: "context.bluetoothControl",
+    });
+  });
+}
+if (adminModeButton) {
+  adminModeButton.addEventListener("click", () => {
+    runAction(toggleAdminMode, {
+      contextKey: "context.adminMode",
+      button: adminModeButton,
     });
   });
 }
@@ -2189,15 +2374,19 @@ if (languageSelect) {
     refreshHealth().catch((err) => {
       reportError(err, { contextKey: "context.apiHealthcheck", dedupeMs: 10000 });
     });
-    refreshConnections().catch((err) => {
-      reportError(err, { contextKey: "context.viewSetup", dedupeMs: 10000 });
-    });
+    if (hasAdminToken()) {
+      refreshConnections().catch((err) => {
+        reportError(err, { contextKey: "context.viewSetup", dedupeMs: 10000 });
+      });
+    }
     refreshRanking().catch((err) => {
       reportError(err, { contextKey: "context.liveRanking", dedupeMs: 10000 });
     });
-    refreshNotifications().catch((err) => {
-      reportError(err, { contextKey: "context.notifications", dedupeMs: 10000 });
-    });
+    if (hasAdminToken()) {
+      refreshNotifications().catch((err) => {
+        reportError(err, { contextKey: "context.notifications", dedupeMs: 10000 });
+      });
+    }
   });
 }
 
@@ -2209,6 +2398,7 @@ for (const viewButton of document.querySelectorAll(".tab-btn")) {
 
 setInterval(() => {
   const auto = document.getElementById("auto-refresh")?.checked;
+  if (!hasAdminToken()) return;
   if (!auto) return;
   refreshNotifications().catch((err) => {
     reportError(err, { contextKey: "context.autoRefreshNotifications", dedupeMs: 15000 });
@@ -2237,10 +2427,16 @@ async function bootstrap() {
   refreshHealth().catch((err) => {
     reportError(err, { contextKey: "context.apiHealthcheck", dedupeMs: 10000 });
   });
-  runAction(refreshConnections, { contextKey: "context.viewSetup" });
+  if (hasAdminToken()) {
+    runAction(refreshConnections, { contextKey: "context.viewSetup" });
+  }
   runAction(refreshRanking, { contextKey: "context.liveRanking" });
-  openLiveStream();
-  activateView("setup");
+  if (hasAdminToken()) {
+    openLiveStream().catch((err) => {
+      reportError(err, { contextKey: "context.liveStream", dedupeMs: 10000 });
+    });
+  }
+  activateView(hasAdminToken() ? "setup" : "game");
 }
 
 bootstrap().catch((err) => {

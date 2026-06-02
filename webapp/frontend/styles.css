@@ -114,6 +114,10 @@ h2 {
   display: none !important;
 }
 
+.admin-hidden {
+  display: none !important;
+}
+
 .row {
   display: flex;
   flex-wrap: wrap;

@@ -18,6 +18,11 @@ __pycache__/
 venv/
 env/
 
+# Local project secrets
+.env
+.env.*
+!.env.example
+
 # Distribution / packaging
 dist/
 build/

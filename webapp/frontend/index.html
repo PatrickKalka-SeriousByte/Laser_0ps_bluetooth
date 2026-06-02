@@ -11,6 +11,7 @@
     <header class="topbar">
       <h1 data-i18n="app.heading">LaserOps Control Center</h1>
       <div class="topbar-actions">
+        <button id="btn-admin-mode" type="button" data-i18n="button.adminEnable">Enable admin</button>
         <label class="lang-picker">
           <span data-i18n="label.language">Language</span>
           <select id="language-select">
@@ -23,9 +24,9 @@
     </header>
 
     <nav class="view-tabs" aria-label="Views">
-      <button type="button" class="tab-btn active" data-view-target="setup" data-i18n="tab.setup">Pre-game setup</button>
+      <button type="button" class="tab-btn active" data-view-target="setup" data-i18n="tab.setup" data-admin-only>Pre-game setup</button>
       <button type="button" class="tab-btn" data-view-target="game" data-i18n="tab.game">Live game</button>
-      <button type="button" class="tab-btn" data-view-target="admin" data-i18n="tab.admin">Admin / Debug</button>
+      <button type="button" class="tab-btn" data-view-target="admin" data-i18n="tab.admin" data-admin-only>Admin / Debug</button>
     </nav>
 
     <section id="errors-band" class="band hidden">
@@ -36,7 +37,7 @@
       <pre id="errors" class="log error-log"></pre>
     </section>
 
-    <section class="band view-pane" data-view="setup">
+    <section class="band view-pane" data-view="setup" data-admin-only>
       <h2 data-i18n="section.deviceSearch">Device scan</h2>
       <div class="row">
         <label><span data-i18n="label.scanTimeout">Scan duration (seconds)</span>
@@ -68,7 +69,7 @@
       </div>
     </section>
 
-    <section class="band view-pane" data-view="setup">
+    <section class="band view-pane" data-view="setup" data-admin-only>
       <h2 data-i18n="section.connections">Connections</h2>
       <div class="row">
         <button id="btn-refresh-connections" type="button" data-i18n="button.refresh">Refresh</button>
@@ -92,7 +93,7 @@
       </div>
     </section>
 
-    <section class="band view-pane" data-view="setup">
+    <section class="band view-pane" data-view="setup" data-admin-only>
       <h2 data-i18n="section.setup">Pre-game setup</h2>
       <p class="hint" data-i18n="hint.localNames">Local names only apply in this web UI and do not overwrite the device name on the blaster.</p>
       <div class="table-wrap">
@@ -131,7 +132,7 @@
       <div class="row">
         <div id="ranking-state" class="pill" data-i18n="status.noActiveGame">No active game</div>
         <button id="btn-refresh-ranking" type="button" data-i18n="button.refreshRanking">Refresh ranking</button>
-        <button id="btn-game-end" type="button" data-i18n="button.endRound">End round cleanly</button>
+        <button id="btn-game-end" type="button" data-i18n="button.endRound" data-admin-only>End round cleanly</button>
       </div>
       <p class="hint" data-i18n="hint.liveCounters">During the round, shots/reloads are counted live. Hits/kills are available after the round ends.</p>
       <div class="table-wrap">
@@ -177,7 +178,7 @@
       </div>
     </section>
 
-    <section class="band view-pane" data-view="game">
+    <section class="band view-pane" data-view="game" data-admin-only>
       <h2 data-i18n="section.liveData">Live data</h2>
       <div class="row">
         <div id="live-state" class="pill" data-i18n="status.liveOff">Live stream: off</div>
@@ -204,7 +205,7 @@
       </div>
     </section>
 
-    <section class="band view-pane" data-view="admin">
+    <section class="band view-pane" data-view="admin" data-admin-only>
       <h2 data-i18n="section.admin">Controls (Admin / Debug)</h2>
       <div class="row">
         <label><span data-i18n="label.targetAddress">Target address (blaster MAC)</span>
@@ -274,12 +275,12 @@
       </div>
     </section>
 
-    <section class="band view-pane" data-view="admin">
+    <section class="band view-pane" data-view="admin" data-admin-only>
       <h2 data-i18n="section.liveEventLog">Live event log (Debug)</h2>
       <pre id="live-events" class="log"></pre>
     </section>
 
-    <section class="band view-pane" data-view="admin">
+    <section class="band view-pane" data-view="admin" data-admin-only>
       <h2 data-i18n="section.notifications">Notifications</h2>
       <div class="row">
         <button id="btn-refresh-notifications" type="button" data-i18n="button.refresh">Refresh</button>
@@ -291,7 +292,7 @@
       <pre id="notifications" class="log"></pre>
     </section>
 
-    <section class="band view-pane" data-view="admin">
+    <section class="band view-pane" data-view="admin" data-admin-only>
       <h2 data-i18n="section.apiResponse">API response</h2>
       <pre id="response" class="log"></pre>
     </section>

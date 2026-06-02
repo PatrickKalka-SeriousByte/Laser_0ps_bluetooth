@@ -4,17 +4,63 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from webapp.backend.ble_service import BleHub
+
+ADMIN_TOKEN_ENV = "LASEROPS_ADMIN_TOKEN"
+ADMIN_TOKEN_HEADER = "x-laserops-admin-token"
+ADMIN_TOKEN_QUERY_PARAM = "admin_token"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ENV_PATH = PROJECT_ROOT / ".env"
+PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/server/restart-status",
+    "/api/game/ranking",
+    "/api/game/ranking/",
+}
+
+
+def _strip_env_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def _load_project_env(path: Path = PROJECT_ENV_PATH) -> None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep and key and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            if not os.environ.get(key, "").strip():
+                os.environ[key] = _strip_env_quotes(value)
+
+
+_load_project_env()
+
+
+def _admin_token() -> str:
+    _load_project_env()
+    return os.environ.get(ADMIN_TOKEN_ENV, "").strip()
 
 
 class ScanRequest(BaseModel):
@@ -108,6 +154,34 @@ app.mount("/assets", StaticFiles(directory=frontend_dir), name="assets")
 
 def _hub(request: Request) -> BleHub:
     return request.app.state.ble_hub
+
+
+def _require_admin_token(request: Request) -> None:
+    expected_token = _admin_token()
+    if not expected_token:
+        raise HTTPException(
+            status_code=403,
+            detail=f"API access is disabled; set {ADMIN_TOKEN_ENV}",
+        )
+    supplied_token = request.headers.get(ADMIN_TOKEN_HEADER, "")
+    if not supplied_token and request.url.path == "/api/live/stream":
+        supplied_token = request.query_params.get(ADMIN_TOKEN_QUERY_PARAM, "")
+    if not secrets.compare_digest(supplied_token, expected_token):
+        raise HTTPException(status_code=403, detail="invalid admin token")
+
+
+def _is_protected_api_request(request: Request) -> bool:
+    return request.url.path.startswith("/api/") and request.url.path not in PUBLIC_API_PATHS
+
+
+@app.middleware("http")
+async def require_api_token(request: Request, call_next):
+    if _is_protected_api_request(request):
+        try:
+            _require_admin_token(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
 
 
 async def _run_host_command(
@@ -249,8 +323,20 @@ async def health() -> dict[str, object]:
     }
 
 
+@app.get("/api/server/restart-status")
+async def restart_status() -> dict[str, object]:
+    enabled = bool(_admin_token())
+    return {"api_auth_enabled": enabled, "restart_enabled": enabled}
+
+
+@app.get("/api/auth/check")
+async def auth_check() -> dict[str, object]:
+    return {"status": "ok"}
+
+
 @app.post("/api/server/restart")
-async def restart_server() -> dict[str, object]:
+async def restart_server(request: Request) -> dict[str, object]:
+    _require_admin_token(request)
     restart_argv = [sys.executable, *sys.argv]
 
     async def _restart_soon() -> None:

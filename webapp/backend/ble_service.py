@@ -54,6 +54,9 @@ CONNECT_STARTUP_PROBE_TIMEOUT = 5.0
 LOCAL_NAME_MAX_LENGTH = 32
 LOCAL_NAME_STORE_FILENAME = "local_names.json"
 DEBUG_EVENT_LOG_FILENAME = "live_event_log.ndjson"
+DEBUG_EVENT_LOG_MAX_BYTES = 1_048_576
+DEBUG_EVENT_LOG_MAX_LINE_BYTES = 65_536
+DEBUG_EVENT_LOG_ROTATED_SUFFIX = ".old"
 ROUND_SLOT_STATS_ERROR_DETAIL_LIMIT = 8
 AUTO_END_ROUND_SHOTS_GRACE_SECONDS = 3.0
 TEAM_CONFIRMATION_LINK_LOSS_WINDOW_SECONDS = 3.0
@@ -3115,23 +3118,68 @@ class BleHub:
 
     async def _publish_event(self, *, event_type: str, payload: dict[str, Any]) -> None:
         event = self._build_event(event_type=event_type, payload=payload)
-        await self._append_event_to_debug_log(event)
         async with self._subscribers_lock:
             queues = list(self._subscribers.values())
         for queue in queues:
             self._queue_put_drop_oldest(queue, event)
+        await self._append_event_to_debug_log(event)
 
     async def _append_event_to_debug_log(self, event: dict[str, Any]) -> None:
+        if self._debug_event_log_lock.locked():
+            # Debug logging is best-effort; do not queue unbounded writes during
+            # event floods.
+            return
+        try:
+            line = self._format_debug_event_log_line(event)
+            async with self._debug_event_log_lock:
+                await asyncio.to_thread(self._append_line_to_file, line)
+        except (OSError, TypeError, ValueError):
+            # Debug logging must never prevent delivery to live subscribers when
+            # storage is unavailable, full, or a payload cannot be serialized.
+            pass
+
+    def _format_debug_event_log_line(self, event: dict[str, Any]) -> str:
         line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
-        async with self._debug_event_log_lock:
-            await asyncio.to_thread(self._append_line_to_file, line)
+        line_size = len(line.encode("utf-8"))
+        if line_size <= DEBUG_EVENT_LOG_MAX_LINE_BYTES:
+            return line
+        return json.dumps(
+            {
+                "seq": event.get("seq"),
+                "type": event.get("type"),
+                "ts": event.get("ts"),
+                "truncated": True,
+                "original_size_bytes": line_size,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
 
     def _append_line_to_file(self, line: str) -> None:
         path = self._debug_event_log_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
+        line_bytes = len(line.encode("utf-8")) + 1
+        if line_bytes > DEBUG_EVENT_LOG_MAX_BYTES:
+            return
+        if (
+            path.exists()
+            and path.stat().st_size + line_bytes > DEBUG_EVENT_LOG_MAX_BYTES
+        ):
+            self._rotate_debug_event_log(path)
+        with path.open("a", encoding="utf-8", newline="\n") as fh:
             fh.write(line)
             fh.write("\n")
+
+    def _rotate_debug_event_log(self, path: Path) -> None:
+        rotated_path = path.with_name(f"{path.name}{DEBUG_EVENT_LOG_ROTATED_SUFFIX}")
+        if rotated_path.exists():
+            rotated_path.unlink()
+        if not path.exists():
+            return
+        if path.stat().st_size > DEBUG_EVENT_LOG_MAX_BYTES:
+            path.unlink()
+            return
+        path.replace(rotated_path)
 
     def _build_event(self, *, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         self._event_seq += 1
